@@ -12,6 +12,10 @@ Features:
 - Interactive charts and results display
 """
 
+import os
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from flask import Flask, render_template, request
 import fastf1
 import pandas as pd
@@ -19,20 +23,18 @@ import numpy as np
 import requests
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.metrics import mean_absolute_error
-from sklearn.metrics import mean_squared_error, r2_score
-import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.impute import SimpleImputer
 import datetime
 import seaborn as sns
-import matplotlib.pyplot as plt
 from io import BytesIO
 import base64
 from xgboost import XGBRegressor
 
 # Initialize Flask app
-app = Flask(__name__)
+app = Flask(__name__, template_folder='templates')
 
+os.makedirs("f1_cache", exist_ok=True)
 fastf1.Cache.enable_cache("f1_cache")
 
 # Grand Prix schedule with round numbers, dates, times, and coordinates for weather API
@@ -66,6 +68,124 @@ gp_schedule = {
 # List of F1 drivers for 2025 season
 drivers = ["VER", "TSU", "NOR", "PIA", "RUS", "LEC", "HAM", "SAI", "ALB", "ALO", "STR", "OCO", "GAS", "HUL"]
 
+# Detailed metadata for 2025 drivers: car numbers, full names, official teams, default lap times, and motorsport hex colors
+DRIVER_DETAILS = {
+    "VER": {"name": "Max Verstappen", "car_no": 1, "team": "Red Bull Racing", "color": "#3671C6", "default_time": 88.0},
+    "TSU": {"name": "Yuki Tsunoda", "car_no": 22, "team": "Red Bull Racing", "color": "#3671C6", "default_time": 88.5},
+    "NOR": {"name": "Lando Norris", "car_no": 4, "team": "McLaren", "color": "#FF8000", "default_time": 89.0},
+    "PIA": {"name": "Oscar Piastri", "car_no": 81, "team": "McLaren", "color": "#FF8000", "default_time": 89.5},
+    "RUS": {"name": "George Russell", "car_no": 63, "team": "Mercedes", "color": "#27F4D2", "default_time": 90.0},
+    "LEC": {"name": "Charles Leclerc", "car_no": 16, "team": "Ferrari", "color": "#E8002D", "default_time": 90.5},
+    "HAM": {"name": "Lewis Hamilton", "car_no": 44, "team": "Ferrari", "color": "#E8002D", "default_time": 91.0},
+    "SAI": {"name": "Carlos Sainz", "car_no": 55, "team": "Williams", "color": "#64C4FF", "default_time": 91.5},
+    "ALB": {"name": "Alexander Albon", "car_no": 23, "team": "Williams", "color": "#64C4FF", "default_time": 92.0},
+    "ALO": {"name": "Fernando Alonso", "car_no": 14, "team": "Aston Martin", "color": "#229971", "default_time": 92.5},
+    "STR": {"name": "Lance Stroll", "car_no": 18, "team": "Aston Martin", "color": "#229971", "default_time": 93.0},
+    "OCO": {"name": "Esteban Ocon", "car_no": 31, "team": "Haas", "color": "#B6BABD", "default_time": 93.5},
+    "GAS": {"name": "Pierre Gasly", "car_no": 10, "team": "Alpine", "color": "#0093CC", "default_time": 94.0},
+    "HUL": {"name": "Nico Hülkenberg", "car_no": 27, "team": "Kick Sauber", "color": "#52E252", "default_time": 94.5}
+}
+
+# Constructor team pairings for line-wise alignment (driver1, driver2 or None if single driver)
+TEAM_DRIVER_PAIRS = [
+    ("Red Bull Racing", "VER", "TSU"),
+    ("McLaren", "NOR", "PIA"),
+    ("Mercedes", "RUS", None),
+    ("Ferrari", "LEC", "HAM"),
+    ("Williams", "SAI", "ALB"),
+    ("Aston Martin", "ALO", "STR"),
+    ("Haas", "OCO", None),
+    ("Alpine", "GAS", None),
+    ("Kick Sauber", "HUL", None)
+]
+
+def setup_dark_chart_rc():
+    """Configure dark telemetry aesthetic for matplotlib / seaborn charts."""
+    plt.rcParams.update({
+        'figure.facecolor': '#0B0F19',
+        'axes.facecolor': '#111827',
+        'axes.edgecolor': '#232D42',
+        'axes.labelcolor': '#94A3B8',
+        'xtick.color': '#94A3B8',
+        'ytick.color': '#94A3B8',
+        'grid.color': '#1F2937',
+        'grid.linestyle': '--',
+        'grid.alpha': 0.5,
+        'text.color': '#F8FAFC',
+        'font.family': 'sans-serif'
+    })
+
+weather_cache = {}
+
+def get_weather_for_gp(gp_choice):
+    """
+    Fetch weather forecast for a selected Grand Prix using OpenWeatherMap API with caching and error handling.
+    """
+    if not gp_choice or gp_choice not in gp_schedule:
+        return {
+            "gp_choice": gp_choice or "Unknown",
+            "rain_probability": 0.0,
+            "temperature": 22.0,
+            "race_date": "TBD",
+            "race_time": "13:00",
+            "condition": "Dry / Normal"
+        }
+
+    if gp_choice in weather_cache:
+        return weather_cache[gp_choice]
+
+    gp_data = gp_schedule[gp_choice]
+    lat = gp_data["lat"]
+    lon = gp_data["lon"]
+    gp_date_str = gp_data.get("date", "May 18").strip()
+    gp_time_str = gp_data.get("time", "13:00").strip()
+    API_KEY = "6659192f0eeaf84f10720b9d60458a75"
+
+    rain_probability = 0.0
+    temperature = 22.0
+    condition = "Clear Sky"
+
+    try:
+        curr_year = 2025
+        gp_datetime = datetime.datetime.strptime(f"{curr_year} {gp_date_str} {gp_time_str}", "%Y %B %d %H:%M")
+        weather_url = f"http://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={API_KEY}&units=metric"
+        response = requests.get(weather_url, timeout=4)
+        if response.status_code == 200:
+            weather_data = response.json()
+            if "list" in weather_data and len(weather_data["list"]) > 0:
+                forecast_data = min(
+                    weather_data["list"],
+                    key=lambda f: abs(datetime.datetime.strptime(f["dt_txt"], "%Y-%m-%d %H:%M:%S") - gp_datetime)
+                )
+                rain_probability = float(forecast_data.get("pop", 0.0))
+                temperature = float(forecast_data.get("main", {}).get("temp", 22.0))
+                if forecast_data.get("weather") and len(forecast_data["weather"]) > 0:
+                    condition = forecast_data["weather"][0].get("description", "Clear").title()
+    except Exception as e:
+        print(f"Weather API error for {gp_choice}: {e}")
+
+    result = {
+        "gp_choice": gp_choice,
+        "rain_probability": rain_probability,
+        "temperature": round(temperature, 1),
+        "race_date": gp_date_str,
+        "race_time": gp_time_str,
+        "condition": condition
+    }
+    weather_cache[gp_choice] = result
+    return result
+
+# ---------------- Route 0: API for Instant Weather by Grand Prix ----------------
+@app.route('/api/weather')
+def api_weather():
+    """
+    Return live weather data as JSON as soon as a Grand Prix is selected in the UI.
+    """
+    gp_choice = request.args.get('grand_prix', '').strip()
+    if not gp_choice or gp_choice not in gp_schedule:
+        return {"error": "Invalid Grand Prix"}, 400
+    return get_weather_for_gp(gp_choice)
+
 # ---------------- Route 1: Display Input Form ----------------
 @app.route('/')
 def home():
@@ -75,7 +195,16 @@ def home():
     Returns:
         str: Rendered HTML template for the home page.
     """
-    return render_template('index.html', grand_prix_list=gp_schedule.keys(), drivers=drivers)
+    return render_template(
+        'index.html',
+        grand_prix_list=list(gp_schedule.keys()),
+        drivers=drivers,
+        driver_details=DRIVER_DETAILS,
+        team_driver_pairs=TEAM_DRIVER_PAIRS,
+        selected_gp='',
+        user_inputs={},
+        user_dnfs={}
+    )
 
 # ---------------- Route 2: Handle User Input + Run Prediction ----------------
 @app.route('/predict', methods=['POST'])
@@ -121,19 +250,29 @@ def predict():
         sector_times_2024["Sector3Time (s)"]
     )
 
+    # collect qualifying times and form inputs
+    user_inputs = {}
+    user_dnfs = {}
     qualifying_2025 = []
 
-    # collect qualifying times from form
     for driver in drivers:
         dnf_flag = request.form.get(f"{driver}_dnf")
-        if dnf_flag == "DNF":
+        raw_val = request.form.get(driver, "")
+        user_inputs[driver] = raw_val
+        is_dnf = (dnf_flag == "DNF")
+        user_dnfs[driver] = is_dnf
+
+        if is_dnf:
             qualifying_2025.append(None)  # will impute later
         else:
-            value = request.form.get(driver)
-            qualifying_2025.append(float(value))
+            try:
+                qualifying_2025.append(float(raw_val))
+            except (ValueError, TypeError):
+                qualifying_2025.append(None)
         
     # impute DNFs with max time + 5 penalty
-    max_time = max([t for t in qualifying_2025 if t is not None])
+    valid_times = [t for t in qualifying_2025 if t is not None]
+    max_time = max(valid_times) if valid_times else 90.0
     qualifying_2025 = [t if t is not None else max_time + 5 for t in qualifying_2025]
 
     # create DataFrame
@@ -162,49 +301,34 @@ def predict():
         "GAS": 0.9691866544335193, "ALB": 0.9147229519070319
 }
 
-    # ---------------- Weather API ----------------
-    API_KEY = "6659192f0eeaf84f10720b9d60458a75"
+    # ---------------- Weather API & Proportional Wet Weather Adjustment ----------------
+    weather_info = get_weather_for_gp(gp_choice)
+    rain_probability = weather_info["rain_probability"]
+    temperature = weather_info["temperature"]
 
-    lat = gp_data["lat"]
-    lon = gp_data["lon"]
-    # GP date and time (from gp_schedule)
-    # You can extend gp_schedule to include exact 'date' and 'time' strings
-    gp_date_str = gp_data.get("date", "2025-05-18")  # fallback if date not set
-    gp_time_str = gp_data.get("time", "06:00")   # fallback if time not set
-    gp_time_str = gp_time_str.strip()
+    # Normalize rain probability to a fraction in [0.0, 1.0]
+    rain_p = float(rain_probability) / 100.0 if float(rain_probability) > 1.0 else float(rain_probability)
+    rain_p = max(0.0, min(1.0, rain_p))
+    rain_pct = int(round(rain_p * 100))
 
-    curr_year = 2025
-    # Convert to datetime object
-    # Remove 'UTC' and parse
-    # Correct datetime parsing
-    gp_datetime = datetime.datetime.strptime(f"{curr_year} {gp_date_str} {gp_time_str}", "%Y %B %d %H:%M")
+    print(f"Weather for {gp_choice} -> Rain Probability: {rain_p} ({rain_pct}%), Temperature: {temperature}°C")
 
+    # Whenever there is a rain prediction, apply proportional wet weather effect:
+    # e.g. 20% rain applies 20% effect, 80% rain applies 80% effect
+    if rain_p > 0.0:
+        def get_effective_wet_factor(driver):
+            w = wet_weather_factor.get(driver, 1.0)
+            return (1.0 - rain_p) * 1.0 + rain_p * w
 
-    # OpenWeatherMap API call
-    weather_url = f"http://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={API_KEY}&units=metric"
-    response = requests.get(weather_url)
-    weather_data = response.json()
-
-    # Find the closest forecast entry to the GP datetime
-    forecast_data = min(weather_data["list"], key=lambda f: abs(datetime.datetime.strptime(f["dt_txt"], "%Y-%m-%d %H:%M:%S") - gp_datetime))
-
-    rain_probability = forecast_data.get("pop", 0)
-    temperature = forecast_data.get("main", {}).get("temp", 20)
-
-    print(f"Weather for {gp_choice} at {gp_datetime} -> Rain Probability: {rain_probability}, Temperature: {temperature}°C")
-
-
-# ---------------- Adjust qualifying for weather (if needed) ----------------
-    if rain_probability >= 0.75:
-    # Multiply each driver's qualifying time by their wet weather factor
         qualifying_2025_df["QualifyingTime"] = qualifying_2025_df.apply(
-        lambda row: row["QualifyingTime"] * wet_weather_factor.get(row["Driver"], 1), axis=1
-    )
-        print("Rain expected! Adjusted qualifying times applied.")
+            lambda row: row["QualifyingTime"] * get_effective_wet_factor(row["Driver"]), axis=1
+        )
+        qualifying_2025_df["CleanAirRacePace (s)"] = qualifying_2025_df.apply(
+            lambda row: row["CleanAirRacePace (s)"] * get_effective_wet_factor(row["Driver"]), axis=1
+        )
+        print(f"Rain prediction ({rain_pct}%) detected! Applied {rain_pct}% proportional wet weather pace adjustment.")
     else:
-    # No rain: keep original qualifying times
-        qualifying_2025_df["QualifyingTime"] = qualifying_2025_df["QualifyingTime"]
-        print("No rain expected. Qualifying times remain unchanged.")
+        print("Dry conditions (0% rain). Baseline pace modeling applied.")
 
     # ---------------- Teams and constructor performance ----------------
     team_points = {
@@ -217,7 +341,7 @@ def predict():
     driver_to_team = {
         "VER": "Red Bull", "NOR": "McLaren", "PIA": "McLaren", "LEC": "Ferrari", "RUS": "Mercedes",
         "HAM": "Ferrari", "GAS": "Alpine", "ALO": "Aston Martin", "TSU": "Red Bull",
-        "SAI": "Willams", "HUL": "Kick Sauber", "OCO": "Hass", "STR": "Aston Martin" , "ALB" : "Willams"
+        "SAI": "Williams", "HUL": "Kick Sauber", "OCO": "Haas", "STR": "Aston Martin", "ALB": "Williams"
     }
     qualifying_2025_df["Team"] = qualifying_2025_df["Driver"].map(driver_to_team)
     qualifying_2025_df["TeamPerformanceScore"] = qualifying_2025_df["Team"].map(team_performance_score)
@@ -293,8 +417,8 @@ def predict():
     dnf_drivers = [driver for driver in drivers if request.form.get(f"{driver}_dnf") == "DNF"]
 
     # Create columns for HTML display
-    final_results['QualifyingTime_display'] = final_results['QualifyingTime']
-    final_results['PredictedRaceTime_display'] = final_results['PredictedRaceTime (s)']
+    final_results['QualifyingTime_display'] = final_results['QualifyingTime'].astype(object)
+    final_results['PredictedRaceTime_display'] = final_results['PredictedRaceTime (s)'].astype(object)
 
     # Mark DNF drivers for HTML
     for driver in dnf_drivers:
@@ -318,25 +442,56 @@ def predict():
     final_results.drop(columns=['sort_time'], inplace=True)
 
     # ---------------- Podium ----------------
-    podium = final_results[final_results['PredictedRaceTime_display'] != "DNF"].head(3)
-    podium = podium[["Driver", "Team", "PredictedRaceTime_display"]].copy()
-    podium.rename(columns={"Driver": "driver", "Team": "team", "PredictedRaceTime_display": "time"}, inplace=True)
-    podium['time'] = podium['time'].apply(lambda x: round(x, 2) if isinstance(x, (int, float, np.float64)) else x)
+    podium_df = final_results[final_results['PredictedRaceTime_display'] != "DNF"].head(3).copy()
+    p1_time = podium_df.iloc[0]["PredictedRaceTime (s)"] if len(podium_df) > 0 else None
+
+    podium_list = []
+    for rank, (_, row) in enumerate(podium_df.iterrows(), start=1):
+        code = row["Driver"]
+        d_meta = DRIVER_DETAILS.get(code, {"name": code, "car_no": "-", "team": row.get("Team", ""), "color": "#E10600"})
+        pred_val = row["PredictedRaceTime_display"]
+        pred_rounded = round(pred_val, 3) if isinstance(pred_val, (int, float, np.float64)) else pred_val
+        delta_str = "LEADER" if rank == 1 else (f"+{(row['PredictedRaceTime (s)'] - p1_time):.3f}s" if p1_time else "-")
+        podium_list.append({
+            "rank": rank,
+            "driver": code,
+            "name": d_meta["name"],
+            "car_no": d_meta["car_no"],
+            "team": d_meta["team"],
+            "team_color": d_meta["color"],
+            "time": pred_rounded,
+            "delta": delta_str
+        })
 
     # ---------------- Full Results ----------------
-    full_results = final_results[["Driver", "Team", "QualifyingTime_display", "PredictedRaceTime_display"]].copy()
-    full_results.rename(columns={
-        "Driver": "driver",
-        "Team": "team",
-        "QualifyingTime_display": "qualifying",
-        "PredictedRaceTime_display": "predicted"
-    }, inplace=True)
+    full_results_list = []
+    for rank, (_, row) in enumerate(final_results.iterrows(), start=1):
+        code = row["Driver"]
+        d_meta = DRIVER_DETAILS.get(code, {"name": code, "car_no": "-", "team": row.get("Team", ""), "color": "#E10600"})
+        q_val = row["QualifyingTime_display"]
+        p_val = row["PredictedRaceTime_display"]
+        q_display = f"{q_val:.3f}s" if isinstance(q_val, (int, float, np.float64)) else str(q_val)
+        p_display = f"{p_val:.3f}s" if isinstance(p_val, (int, float, np.float64)) else str(p_val)
+        
+        if p_val == "DNF" or p1_time is None:
+            delta_str = "DNF"
+        elif rank == 1:
+            delta_str = "LEADER"
+        else:
+            delta_str = f"+{(row['PredictedRaceTime (s)'] - p1_time):.3f}s"
 
-    # Round numeric times only, leave DNFs as is
-    full_results["qualifying"] = full_results["qualifying"].apply(lambda x: round(x,2) if isinstance(x,(int,float,np.float64)) else x)
-    full_results["predicted"] = full_results["predicted"].apply(lambda x: round(x,2) if isinstance(x,(int,float,np.float64)) else x)
-
-    full_results_list = full_results.to_dict(orient="records")
+        full_results_list.append({
+            "rank": rank,
+            "driver": code,
+            "name": d_meta["name"],
+            "car_no": d_meta["car_no"],
+            "team": d_meta["team"],
+            "team_color": d_meta["color"],
+            "qualifying": q_display,
+            "predicted": p_display,
+            "delta": delta_str,
+            "is_dnf": (p_val == "DNF")
+        })
 
     # ---------------- Calculate MAE ----------------
     mae = mean_absolute_error(y, merged_data["PredictedRaceTime (s)"])
@@ -345,10 +500,11 @@ def predict():
     # ---------------- Results Dictionary ----------------
     results = {
         "gp_choice": gp_choice,
-        "rain_probability": rain_probability,
+        "rain_probability": rain_p,
+        "rain_pct": rain_pct,
         "temperature": temperature,
         "race_date": gp_data["date"],
-        "podium": podium.to_dict(orient="records"),
+        "podium": podium_list,
         "full_results": full_results_list,
         "mae": mae,
         "metrics": {
@@ -359,105 +515,136 @@ def predict():
         }
     }
 
-    # ------------------- 5️⃣ Effect of Clean Air Race Pace -------------------
-    sns.set_style("darkgrid")
-    fig, ax = plt.subplots(figsize=(12,8))
+    # ------------------- 1️⃣ Effect of Clean Air Race Pace (Dark Themed) -------------------
+    setup_dark_chart_rc()
+    fig, ax = plt.subplots(figsize=(10, 6))
 
     x = final_results["CleanAirRacePace (s)"]
     y = final_results["PredictedRaceTime (s)"]
 
-    ax.scatter(x, y, color='#1d3557', s=100)
+    ax.scatter(x, y, color='#38BDF8', s=90, edgecolors='#E10600', linewidth=1.5, alpha=0.9, zorder=4)
 
-    # Annotate each driver
     for i, driver in enumerate(final_results["Driver"]):
-        ax.annotate(driver, (x.iloc[i], y.iloc[i]), xytext=(5,5), textcoords='offset points', fontsize=10, fontweight='bold')
+        ax.annotate(driver, (x.iloc[i], y.iloc[i]), xytext=(6, 4), textcoords='offset points', fontsize=9, fontweight='bold', color='#F8FAFC')
 
-    ax.set_xlabel("Clean Air Race Pace (s)", fontsize=12, fontweight='bold')
-    ax.set_ylabel("Predicted Race Time (s)", fontsize=12, fontweight='bold')
-    ax.set_title("Effect of Clean Air Race Pace on Predicted Race Results", fontsize=14, fontweight='bold', color='#f77f00')
-    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.set_xlabel("Clean Air Race Pace (s)", fontsize=11, fontweight='bold', color='#94A3B8')
+    ax.set_ylabel("Predicted Race Lap Time (s)", fontsize=11, fontweight='bold', color='#94A3B8')
+    ax.set_title("Pace Correlation: Clean Air Pace vs Predicted Lap Time", fontsize=12, fontweight='bold', color='#F8FAFC', pad=12)
+    ax.grid(True, linestyle='--', alpha=0.4, zorder=1)
 
     buf = BytesIO()
     plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=150)
+    plt.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
     buf.seek(0)
     cleanair_effect_chart = base64.b64encode(buf.getvalue()).decode('utf-8')
-    plt.close()
-    # ------------------- 1️⃣ Predicted vs Qualifying Times -------------------
+    plt.close(fig)
+
+    # ------------------- 2️⃣ Predicted vs Qualifying Times (Dark Themed) -------------------
+    setup_dark_chart_rc()
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+
+    x_indices = np.arange(len(merged_data["Driver"]))
+    driver_labels = merged_data["Driver"].tolist()
+    qual_times = merged_data["QualifyingTime"].values
+    pred_times = merged_data["PredictedRaceTime (s)"].values
+
+    bar_width = 0.38
+    ax.bar(x_indices - bar_width/2, qual_times, width=bar_width, label='Qualifying Lap Time', color='#38BDF8', alpha=0.85, edgecolor='#0284C7', linewidth=0.8)
+    ax.bar(x_indices + bar_width/2, pred_times, width=bar_width, label='Predicted Race Lap Time', color='#E10600', alpha=0.85, edgecolor='#B91C1C', linewidth=0.8)
+
+    ax.set_xticks(x_indices)
+    ax.set_xticklabels(driver_labels, fontsize=10, fontweight='bold', color='#F8FAFC')
+    ax.set_xlabel("Driver Code", fontsize=11, fontweight='bold', color='#94A3B8')
+    ax.set_ylabel("Lap Time (seconds)", fontsize=11, fontweight='bold', color='#94A3B8')
+    ax.set_title("Telemetry Comparison: Qualifying vs Predicted Race Pace", fontsize=12, fontweight='bold', color='#F8FAFC', pad=12)
     
-    
-    sns.set_style("darkgrid")
-    fig, ax = plt.subplots(figsize=(10,6))
+    valid_all = [t for t in list(qual_times) + list(pred_times) if not np.isnan(t)]
+    if valid_all:
+        ax.set_ylim(max(0, min(valid_all) - 5), max(valid_all) + 5)
 
-    x = merged_data["Driver"]
-    qual_times = merged_data["QualifyingTime"]
-    pred_times = merged_data["PredictedRaceTime (s)"]
-
-    bar_width = 0.35
-    ax.bar(x, qual_times, width=bar_width, label='Qualifying Time', color='#f77f00', alpha=0.8)
-    ax.bar([i for i in range(len(x))], pred_times, width=bar_width, label='Predicted Race Time', color='#e63946', alpha=0.8, align='edge')
-
-    ax.set_xlabel("Driver", fontsize=12, fontweight='bold')
-    ax.set_ylabel("Time (s)", fontsize=12, fontweight='bold')
-    ax.set_title("Predicted vs Qualifying Times", fontsize=14, fontweight='bold', color='#f77f00')
-    ax.legend()
-    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.legend(facecolor='#1E2638', edgecolor='#2E3C56', fontsize=10, labelcolor='#F8FAFC')
+    ax.grid(True, linestyle='--', alpha=0.4, zorder=1)
 
     buf = BytesIO()
     plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=150)
+    plt.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
     buf.seek(0)
     pred_vs_qual_chart = base64.b64encode(buf.getvalue()).decode('utf-8')
-    plt.close()
+    plt.close(fig)
 
-    # ------------------- 2️⃣ Feature Importance -------------------
-    sns.set_style("darkgrid")
-    features = ["QualifyingTime", "RainProbability", "Temperature", "TeamPerformanceScore", "CleanAirRacePace (s)"]
-    importances = model.feature_importances_
+    # ------------------- 3️⃣ Feature Importance (Dark Themed) -------------------
+    setup_dark_chart_rc()
+    feature_labels = ["Qualifying Time", "RainProbability", "Temperature", "TeamPerformanceScore", "CleanAirRacePace (s)"]
+    importances = np.array(model.feature_importances_, dtype=float).copy()
 
-    fig, ax = plt.subplots(figsize=(8,5))
-    ax.barh(features, importances, color='#457b9d', alpha=0.85)
-    ax.set_xlabel("Importance", fontsize=12, fontweight='bold')
-    ax.set_title("Feature Importance", fontsize=14, fontweight='bold', color='#f77f00')
-    for i, v in enumerate(importances):
-        ax.text(v + 0.005, i, f"{v:.2f}", color='black', fontweight='bold')
+    # Cumulative wet weather pace impact across the field
+    # Reflects the cumulative proportion of wet weather pace applied (e.g. 20% rain -> 0.20 weight)
+    if rain_p > 0.0:
+        wet_imp = min(0.85, float(rain_p))
+        base_sum = importances[0] + importances[3] + importances[4]
+        if base_sum > 0:
+            scale = (1.0 - wet_imp) / base_sum
+            importances[0] = importances[0] * scale
+            importances[3] = importances[3] * scale
+            importances[4] = importances[4] * scale
+        importances[1] = wet_imp
+
+    fig, ax = plt.subplots(figsize=(8.5, 4.5))
+    bars = ax.barh(feature_labels, importances, color='#E10600', alpha=0.88, height=0.52, edgecolor='#991B1B')
+    ax.set_xlabel("Relative Feature Weight (Gain)", fontsize=11, fontweight='bold', color='#94A3B8')
+    ax.set_title("XGBoost Regression Model Feature Importance", fontsize=12, fontweight='bold', color='#F8FAFC', pad=12)
+    for bar in bars:
+        w = bar.get_width()
+        ax.text(w + 0.01, bar.get_y() + bar.get_height()/2, f"{w:.3f}", va='center', color='#F8FAFC', fontweight='bold', fontsize=9)
+    ax.set_xlim(0, max(importances) * 1.18 if max(importances) > 0 else 1.0)
+    ax.grid(True, linestyle='--', alpha=0.4, zorder=1)
 
     buf = BytesIO()
     plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=150)
+    plt.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
     buf.seek(0)
     importance_chart = base64.b64encode(buf.getvalue()).decode('utf-8')
-    plt.close()
+    plt.close(fig)
 
-    # ------------------- 3️⃣ Clean Air vs Predicted Race Time -------------------
-    sns.set_style("darkgrid")
+    # ------------------- 4️⃣ Clean Air vs Predicted Race Time (Dark Themed) -------------------
+    setup_dark_chart_rc()
     sorted_data = merged_data.sort_values("CleanAirRacePace (s)")
-    fig, ax = plt.subplots(figsize=(10,6))
-    ax.plot(sorted_data["Driver"], sorted_data["CleanAirRacePace (s)"], marker='o', linestyle='--', color='#1d3557', label='Clean Air Pace')
-    ax.plot(sorted_data["Driver"], sorted_data["PredictedRaceTime (s)"], marker='s', linestyle='-', color='#e63946', label='Predicted Race Time')
+    fig, ax = plt.subplots(figsize=(10.5, 5.5))
+    ax.plot(sorted_data["Driver"], sorted_data["CleanAirRacePace (s)"], marker='o', markersize=6, linestyle='--', color='#38BDF8', linewidth=1.8, label='Clean Air Benchmark Pace')
+    ax.plot(sorted_data["Driver"], sorted_data["PredictedRaceTime (s)"], marker='s', markersize=6, linestyle='-', color='#E10600', linewidth=2, label='Predicted Race Lap Time')
 
-    ax.set_xlabel("Driver", fontsize=12, fontweight='bold')
-    ax.set_ylabel("Time (s)", fontsize=12, fontweight='bold')
-    ax.set_title("Clean Air vs Predicted Race Time", fontsize=14, fontweight='bold', color='#f77f00')
-    ax.legend()
-    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.set_xlabel("Driver (Ranked by Clean Air Pace)", fontsize=11, fontweight='bold', color='#94A3B8')
+    ax.set_ylabel("Lap Time (seconds)", fontsize=11, fontweight='bold', color='#94A3B8')
+    ax.set_title("Clean Air Benchmark vs XGBoost Predicted Lap Time", fontsize=12, fontweight='bold', color='#F8FAFC', pad=12)
+    ax.legend(facecolor='#1E2638', edgecolor='#2E3C56', fontsize=10, labelcolor='#F8FAFC')
+    ax.grid(True, linestyle='--', alpha=0.4, zorder=1)
 
     buf = BytesIO()
     plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=150)
+    plt.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
     buf.seek(0)
     cleanair_chart = base64.b64encode(buf.getvalue()).decode('utf-8')
-    plt.close()
+    plt.close(fig)
 
     # ------------------- Pass charts to results dict -------------------
     results["charts"] = {
         "pred_vs_qual_chart": pred_vs_qual_chart,
         "importance_chart": importance_chart,
         "cleanair_chart": cleanair_chart,
-        "cleanair_effect_chart" : cleanair_effect_chart
+        "cleanair_effect_chart": cleanair_effect_chart
     }
     # Pass results to template
-    return render_template('index.html', grand_prix_list=gp_schedule.keys(), drivers=drivers, results=results)
+    return render_template(
+        'index.html',
+        grand_prix_list=list(gp_schedule.keys()),
+        drivers=drivers,
+        driver_details=DRIVER_DETAILS,
+        team_driver_pairs=TEAM_DRIVER_PAIRS,
+        results=results,
+        selected_gp=gp_choice,
+        user_inputs=user_inputs,
+        user_dnfs=user_dnfs
+    )
 
 # ---------------- Run Flask App ----------------
 if __name__ == '__main__':
